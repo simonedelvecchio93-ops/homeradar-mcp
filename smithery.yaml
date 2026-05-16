@@ -1,0 +1,27 @@
+name: homeradar
+displayName: HomeRadar — Ricerca Immobiliare Italiana
+description: Cerca immobili in vendita e affitto su Immobiliare.it, Idealista.it e Casa.it direttamente da Claude. Basta scrivere in linguaggio naturale.
+license: MIT
+categories:
+  - search
+  - real-estate
+  - italy
+languages:
+  - it
+  - en
+startCommand:
+  type: stdio
+  configSchema:
+    type: object
+    required:
+      - ANTHROPIC_API_KEY
+    properties:
+      ANTHROPIC_API_KEY:
+        type: string
+        description: "La tua API key Anthropic (console.anthropic.com)"
+  commandFunction: |-
+    (config) => ({
+      command: "python",
+      args: ["server.py"],
+      env: { ANTHROPIC_API_KEY: config.ANTHROPIC_API_KEY }
+    })
