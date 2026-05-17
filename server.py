@@ -166,24 +166,26 @@ def _build_portal_urls(p: CercaImmobiliInput) -> list[dict]:
 
     # ── Idealista.it ────────────────────────────────────
     idea_type_map = {
-        TipoImmobile.APPARTAMENTO: "abitazioni",
-        TipoImmobile.VILLA:        "abitazioni",
+        TipoImmobile.APPARTAMENTO: "case",
+        TipoImmobile.VILLA:        "ville",
         TipoImmobile.UFFICIO:      "uffici",
-        TipoImmobile.NEGOZIO:      "locali-commerciali",
-        TipoImmobile.GARAGE:       "garage-e-box",
+        TipoImmobile.NEGOZIO:      "negozi",
+        TipoImmobile.GARAGE:       "garage",
         TipoImmobile.TERRENO:      "terreni",
         TipoImmobile.CAPANNONE:    "capannoni",
     }
-    idea_type = idea_type_map.get(p.tipo, "abitazioni")
-    idea_q: dict[str, str] = {}
-    if p.budget:     idea_q["prezzo_massimo"]    = p.budget
-    if p.superficie: idea_q["superficie_minima"] = p.superficie
+    idea_type = idea_type_map.get(p.tipo, "case")
+    # Idealista usa filtri nel path, non query string
+    idea_filters = []
     locali_idea = {
         Locali.MONOLOCALE: "1", Locali.BILOCALE: "2",
         Locali.TRILOCALE:  "3", Locali.QUATTRO_PLUS: "4", Locali.CINQUE_PLUS: "5",
     }
-    if p.locali in locali_idea: idea_q["stanze"] = locali_idea[p.locali]
-    idea_qs = ("?" + "&".join(f"{k}={v}" for k, v in idea_q.items())) if idea_q else ""
+    if p.locali in locali_idea:
+        idea_filters.append(f"con-{locali_idea[p.locali]}-locali")
+    if p.budget:
+        idea_filters.append(f"fino-a-{p.budget}-euro")
+    idea_filter_path = (",".join(idea_filters) + "/") if idea_filters else ""
 
     # ── Casa.it ─────────────────────────────────────────
     casa_type_map = {
@@ -203,42 +205,58 @@ def _build_portal_urls(p: CercaImmobiliInput) -> list[dict]:
 
     return [
         {"portale": "Immobiliare.it", "url": f"https://www.immobiliare.it/{immo_path}/{zona}/{immo_qs}"},
-        {"portale": "Idealista.it",   "url": f"https://www.idealista.it/{op}-{idea_type}/{zona}/{idea_qs}"},
+        {"portale": "Idealista.it",   "url": f"https://www.idealista.it/{op}-{idea_type}/{zona}/{idea_filter_path}"},
         {"portale": "Casa.it",        "url": f"https://www.casa.it/{op}/{casa_type}/{zona}/{casa_qs}"},
     ]
 
 
-def _build_query(p: CercaImmobiliInput) -> str:
-    """Costruisce la query in linguaggio naturale per Claude."""
-    q = f"Genera {p.numero_risultati} annunci immobiliari realistici di {p.tipo.value} in {p.operazione.value} a {p.zona}"
-    if p.budget:     q += f", budget massimo {p.budget} euro"
-    if p.superficie: q += f", superficie minima {p.superficie} m²"
+def _build_context(p: CercaImmobiliInput) -> str:
+    """Costruisce il contesto della ricerca per Claude."""
+    q = f"{p.tipo.value} in {p.operazione.value} a {p.zona}"
+    if p.budget:       q += f", budget {p.budget} euro"
+    if p.superficie:   q += f", min {p.superficie} m²"
     if p.locali.value: q += f", {p.locali.value}"
-    if p.ascensore:  q += ", con ascensore"
-    if p.garage:     q += ", con garage o posto auto"
-    if p.giardino:   q += ", con giardino o terrazzo"
-    if p.animali:    q += ", animali ammessi"
-    if p.note:       q += f". Note: {p.note}"
+    if p.ascensore:    q += ", con ascensore"
+    if p.garage:       q += ", con garage"
+    if p.giardino:     q += ", con giardino"
+    if p.animali:      q += ", animali ok"
+    if p.note:         q += f". Note: {p.note}"
     return q
 
 
-async def _chiedi_claude(query: str, analisi: bool, zona: str) -> dict:
+def _format_price(s: str) -> str:
+    """Aggiunge i punti delle migliaia ai numeri in una stringa."""
+    def add_dots(m):
+        n = int(m.group().replace(".", "").replace(",", ""))
+        if n < 100:
+            return m.group()
+        return f"{n:,}".replace(",", ".")
+    return re.sub(r"\d[\d.,]*", add_dots, s)
+
+
+async def _chiedi_claude(contesto: str, analisi: bool, zona: str, budget: str) -> dict:
     """Chiama Claude Haiku e restituisce il JSON parsato."""
     api_key = os.environ.get("ANTHROPIC_API_KEY", "")
     if not api_key:
         raise ValueError("ANTHROPIC_API_KEY non impostata nell'ambiente")
 
+    budget_hint = f" con budget di {budget} euro" if budget else ""
     analisi_field = (
-        f'"analisi_mercato":"analisi prezzi medi al m² e trend mercato a {zona}"'
-        if analisi else '"analisi_mercato":""'
+        f'"{zona}{budget_hint}: indica 2-3 quartieri specifici accessibili con questo budget '
+        f'e 1-2 zone troppo costose. Sii diretto. Max 220 caratteri."'
+        if analisi else '""'
     )
+
     system = (
-        "Sei un esperto immobiliare italiano. Genera annunci con prezzi realistici, "
-        "indirizzi plausibili (strade reali della città) e descrizioni concrete. "
-        "Rispondi SOLO con JSON valido, zero markdown, zero testo aggiuntivo:\n"
-        '{"results":[{"titolo":"","prezzo":"€XXX.XXX","superficie":"XX m²",'
-        '"locali":"Bilocale","indirizzo":"Via reale, N","descrizione":"max 90 car",'
-        f'"prezzo_mq":"X.XXX €/m²"}}],"sommario":"riepilogo breve",{analisi_field}}}'
+        "Sei un esperto del mercato immobiliare italiano. "
+        "Non inventare annunci. Analizza la ricerca e rispondi SOLO con JSON valido "
+        "(zero markdown, zero testo extra):\n"
+        '{"sommario":"descrizione concisa mercato zona max 110 caratteri",'
+        '"stima_prezzo":"range realistico senza simbolo euro es. 280.000 - 380.000",'
+        '"prezzo_mq":"prezzo medio al mq senza simboli es. 4.500",'
+        '"consigli":"1 consiglio pratico max 100 caratteri",'
+        '"zone_simili":["zona vicina 1","zona vicina 2"],'
+        f'"analisi_mercato":{analisi_field}}}'
     )
 
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -251,9 +269,9 @@ async def _chiedi_claude(query: str, analisi: bool, zona: str) -> dict:
             },
             json={
                 "model": MODEL,
-                "max_tokens": 2000,
+                "max_tokens": 1000,
                 "system": system,
-                "messages": [{"role": "user", "content": query}],
+                "messages": [{"role": "user", "content": contesto}],
             },
         )
         resp.raise_for_status()
@@ -263,42 +281,55 @@ async def _chiedi_claude(query: str, analisi: bool, zona: str) -> dict:
     testo = re.sub(r"```json|```", "", testo).strip()
 
     try:
-        return json.loads(testo)
+        parsed = json.loads(testo)
     except json.JSONDecodeError:
         match = re.search(r"\{[\s\S]*\}", testo)
         if match:
-            return json.loads(match.group())
-        raise ValueError("Claude non ha restituito JSON valido")
+            parsed = json.loads(match.group())
+        else:
+            raise ValueError("Claude non ha restituito JSON valido")
+
+    # Formatta i numeri con i punti delle migliaia
+    if parsed.get("stima_prezzo"): parsed["stima_prezzo"] = _format_price(parsed["stima_prezzo"])
+    if parsed.get("prezzo_mq"):    parsed["prezzo_mq"]    = _format_price(parsed["prezzo_mq"])
+    return parsed
 
 
-def _formatta_markdown(risultati: list[dict], portali: list[dict],
-                       sommario: str, analisi: str, params: CercaImmobiliInput) -> str:
-    """Formatta i risultati in Markdown leggibile."""
+PORTAL_EMOJI = {"Immobiliare.it": "🏠", "Idealista.it": "🔑", "Casa.it": "🏡"}
+
+def _formatta_markdown(dati: dict, portali: list[dict], params: CercaImmobiliInput) -> str:
+    """Formatta analisi di mercato + link portali in Markdown leggibile."""
     lines = [
         f"# 🏠 HomeRadar — {params.tipo.value.capitalize()} in {params.operazione.value} a {params.zona}",
         "",
+        "## 📊 Analisi AI del mercato",
+        "",
     ]
-    if sommario:
-        lines += [f"> {sommario}", ""]
 
-    for i, (annuncio, portale) in enumerate(zip(risultati, portali * 10), 1):
-        lines += [
-            f"## {i}. {annuncio.get('titolo', 'Annuncio immobiliare')}",
-            f"📍 **{annuncio.get('indirizzo', '—')}**",
-            f"💶 **{annuncio.get('prezzo', 'N.d.')}**"
-            + (f" · {annuncio.get('prezzo_mq', '')} /m²" if annuncio.get("prezzo_mq") else ""),
-            f"📐 {annuncio.get('superficie', '—')} · {annuncio.get('locali', '—')}",
-            f"📝 {annuncio.get('descrizione', '')}",
-            f"🔗 [Vedi su {portale['portale']}]({portale['url']})",
-            "",
-        ]
+    if dati.get("sommario"):
+        lines += [f"> {dati['sommario']}", ""]
 
-    lines += ["---", "## 🔎 Cerca direttamente sui portali", ""]
+    # Stima prezzo e prezzo al m²
+    prezzi = []
+    if dati.get("stima_prezzo"): prezzi.append(f"**Stima prezzo:** € {dati['stima_prezzo']}")
+    if dati.get("prezzo_mq"):    prezzi.append(f"**Prezzo al m²:** € {dati['prezzo_mq']}/m²")
+    if prezzi:
+        lines += prezzi + [""]
+
+    if dati.get("consigli"):
+        lines += [f"💡 {dati['consigli']}", ""]
+
+    if dati.get("zone_simili"):
+        zone = " · ".join(dati["zone_simili"])
+        lines += [f"📍 Zone simili: {zone}", ""]
+
+    lines += ["---", "## 🔗 Cerca annunci reali su questi portali", ""]
     for p in portali:
-        lines.append(f"- [{p['portale']}]({p['url']})")
+        emoji = PORTAL_EMOJI.get(p["portale"], "🔍")
+        lines.append(f"{emoji} [{p['portale']}]({p['url']})")
 
-    if analisi:
-        lines += ["", "---", "## 📊 Analisi di mercato", "", analisi]
+    if dati.get("analisi_mercato"):
+        lines += ["", "---", "## 📈 Analisi dettagliata", "", dati["analisi_mercato"]]
 
     return "\n".join(lines)
 
@@ -315,10 +346,11 @@ def _formatta_markdown(risultati: list[dict], portali: list[dict],
     },
 )
 async def homeradar_cerca_immobili(params: CercaImmobiliInput) -> str:
-    """Cerca immobili in vendita o affitto in Italia su Immobiliare.it, Idealista.it e Casa.it.
+    """Analizza il mercato immobiliare italiano e genera link reali ai portali di ricerca.
 
-    Genera annunci realistici con prezzi di mercato, indirizzi verosimili e link
-    diretti alle pagine di ricerca filtrate dei portali principali.
+    Fornisce analisi AI del mercato (stima prezzi, consigli, zone alternative) e
+    link diretti con filtri pre-applicati su Immobiliare.it, Idealista.it e Casa.it.
+    Non genera annunci inventati — i link portano a ricerche reali.
 
     Args:
         params (CercaImmobiliInput): Parametri di ricerca:
@@ -330,12 +362,11 @@ async def homeradar_cerca_immobili(params: CercaImmobiliInput) -> str:
             - locali: monolocale, bilocale, trilocale, 4+, 5+
             - ascensore, garage, giardino, animali (bool)
             - note (str, opz.): Preferenze libere
-            - numero_risultati: 1-10 (default 5)
-            - analisi_mercato (bool): Analisi prezzi zona
+            - analisi_mercato (bool): Se True, include zone per fascia di prezzo
             - formato: "markdown" o "json"
 
     Returns:
-        str: Lista annunci con prezzi, indirizzi, caratteristiche e link portali.
+        str: Analisi AI del mercato + link ai portali con filtri applicati.
 
     Esempi d'uso:
         - "Cerca bilocale affitto Milano Navigli max 1200€"
@@ -343,31 +374,25 @@ async def homeradar_cerca_immobili(params: CercaImmobiliInput) -> str:
         - "Appartamenti in vendita a Bologna superficie min 90mq"
     """
     try:
-        portali   = _build_portal_urls(params)
-        query     = _build_query(params)
-        dati      = await _chiedi_claude(query, params.analisi_mercato, params.zona)
-
-        risultati = dati.get("results", [])
-        sommario  = dati.get("sommario", "")
-        analisi   = dati.get("analisi_mercato", "")
-
-        # Assegna portali ciclicamente
-        for i, r in enumerate(risultati):
-            r["portale"] = portali[i % len(portali)]["portale"]
-            r["url"]     = portali[i % len(portali)]["url"]
+        portali  = _build_portal_urls(params)
+        contesto = _build_context(params)
+        dati     = await _chiedi_claude(contesto, params.analisi_mercato, params.zona, params.budget or "")
 
         if params.formato == FormatoRisposta.JSON:
             return json.dumps({
-                "zona":     params.zona,
-                "operazione": params.operazione.value,
-                "tipo":     params.tipo.value,
-                "risultati": risultati,
-                "sommario": sommario,
-                "analisi_mercato": analisi,
-                "portali":  portali,
+                "zona":           params.zona,
+                "operazione":     params.operazione.value,
+                "tipo":           params.tipo.value,
+                "sommario":       dati.get("sommario", ""),
+                "stima_prezzo":   dati.get("stima_prezzo", ""),
+                "prezzo_mq":      dati.get("prezzo_mq", ""),
+                "consigli":       dati.get("consigli", ""),
+                "zone_simili":    dati.get("zone_simili", []),
+                "analisi_mercato":dati.get("analisi_mercato", ""),
+                "portali":        portali,
             }, ensure_ascii=False, indent=2)
 
-        return _formatta_markdown(risultati, portali, sommario, analisi, params)
+        return _formatta_markdown(dati, portali, params)
 
     except ValueError as e:
         return f"❌ Errore configurazione: {e}"
